@@ -25,6 +25,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SelfImprovingCRNN")
 
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
 class SelfImprovingCRNN:
     def __init__(self, input_shape=(28, 28), initial_training=True,
                  lr_factor=0.2, lr_patience=5, min_lr=1e-7,
@@ -143,16 +147,16 @@ class SelfImprovingCRNN:
             y_test = np.argmax(y_test_onehot, axis=1)
 
             # Store data
-            self.x_train = x_train
+            # self.x_train = x_train
             self.y_train = y_train
-            self.y_train_onehot = y_train_onehot
-            self.x_val = x_val
+            # self.y_train_onehot = y_train_onehot
+            # self.x_val = x_val
             self.y_val = y_val
-            self.y_val_onehot = y_val_onehot
-            self.x_test = x_test
+            # self.y_val_onehot = y_val_onehot
+            # self.x_test = x_test
             self.y_test = y_test
-            self.y_test_onehot = y_test_onehot
-            self.x_active = x_active_pool
+            # self.y_test_onehot = y_test_onehot
+            # self.x_active = x_active_pool
             self.y_active = y_active_pool
             self.y_active_onehot = y_active_pool_onehot
 
@@ -1269,10 +1273,10 @@ if __name__ == "__main__":
         # Initialize the self-improving model
         model = SelfImprovingCRNN(
             input_shape=(28, 28),
-            lr_factor=0.2,
-            lr_patience=5,
-            early_stopping_patience=15,
-            epochs=30
+            lr_factor=0.5,
+            lr_patience=3,
+            early_stopping_patience=10,
+            epochs=20
         )
 
         # Train initial model
