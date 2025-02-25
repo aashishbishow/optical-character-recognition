@@ -1074,3 +1074,502 @@ class SelfImprovingCRNN:
             logger.error(f"Error in evaluate method: {str(e)}")
             logger.error(traceback.format_exc())
             return None
+        
+    def identify_improvement_areas(self):
+        """Identify areas where the model needs improvement with error handling"""
+        try:
+            if not self.data_loaded or self.model is None:
+                logger.error("Cannot identify improvement areas: Data not loaded or model not built")
+                return None, None, None
+
+            logger.info("\nIdentifying improvement areas...")
+
+            try:
+                # Generate predictions on test set
+                y_pred = self.model.predict(self.x_test, batch_size=128)
+                y_pred_classes = np.argmax(y_pred, axis=1)
+            except Exception as e:
+                logger.error(f"Prediction failed: {str(e)}")
+                return None, None, None
+
+            # Find misclassified samples and their uncertainties
+            misclassified_indices = np.where(y_pred_classes != np.argmax(self.y_test, axis=1))[0]
+            logger.info(f"Found {len(misclassified_indices)} misclassified samples")
+
+            # Calculate prediction certainty (max probability)
+            prediction_certainty = np.max(y_pred, axis=1)
+
+            # Low certainty predictions (even if correct)
+            # Validate uncertainty threshold
+            valid_threshold = max(0.1, min(0.9, self.uncertainty_threshold))
+            uncertain_indices = np.where(prediction_certainty < valid_threshold)[0]
+            logger.info(f"Found {len(uncertain_indices)} uncertain predictions")
+
+            # Find error patterns by looking at the confusion matrix
+            cm = None
+            cm_no_diagonal = None
+            max_confusion = (0, 0)
+            max_confusion_count = 0
+            
+            try:
+                cm = confusion_matrix(np.argmax(self.y_test, axis=1), y_pred_classes)
+                # Create a copy to avoid modifying original
+                cm_no_diagonal = cm.copy()
+                np.fill_diagonal(cm_no_diagonal, 0)
+                
+                # Check if there are any non-zero values in cm_no_diagonal
+                if np.sum(cm_no_diagonal) > 0:
+                    max_confusion = np.unravel_index(np.argmax(cm_no_diagonal), cm_no_diagonal.shape)
+                    max_confusion_count = int(cm_no_diagonal[max_confusion])
+                    logger.info(f"Highest confusion: True {max_confusion[0]} predicted as {max_confusion[1]} ({max_confusion_count} instances)")
+                else:
+                    logger.info("No confusion detected in the confusion matrix")
+            except Exception as e:
+                logger.warning(f"Could not create confusion matrix: {str(e)}")
+
+            # Collect these areas for improvement
+            improvement_areas = {
+                'misclassified_count': int(len(misclassified_indices)),
+                'uncertain_count': int(len(uncertain_indices)),
+                'max_confusion_pair': [int(max_confusion[0]), int(max_confusion[1])],
+                'max_confusion_count': max_confusion_count,
+                'uncertain_threshold': float(valid_threshold),
+                'timestamp': time.time()
+            }
+            
+            # Initialize model_improvements if it doesn't exist
+            if not hasattr(self, 'model_improvements'):
+                self.model_improvements = []
+                
+            self.model_improvements.append(improvement_areas)
+
+            # Save improvements data
+            try:
+                with open(f'model_improvements_v{self.version}.json', 'w') as f:
+                    json.dump(self.model_improvements, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to save improvements data: {str(e)}")
+
+            return misclassified_indices, uncertain_indices, max_confusion
+
+        except Exception as e:
+            logger.error(f"Error in identify_improvement_areas: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None, None, None
+        
+    def active_learning_sample_selection(self):
+        """Select samples for active learning from dedicated active learning pool"""
+        try:
+            if not self.data_loaded or self.model is None:
+                logger.error("Cannot perform active learning: Data not loaded or model not built")
+                return False
+
+            # Check if active learning datasets exist
+            if not hasattr(self, 'x_active') or self.x_active is None or len(self.x_active) == 0:
+                logger.error("Active learning pool not initialized")
+                return False
+
+            # Generate predictions on active learning pool (not test set)
+            try:
+                y_pred = self.model.predict(self.x_active, batch_size=128)
+                prediction_certainty = np.max(y_pred, axis=1)
+            except Exception as e:
+                logger.error(f"Prediction failed for active learning: {str(e)}")
+                return False
+
+            # Find samples with high uncertainty (low confidence)
+            # Validate uncertainty threshold
+            valid_threshold = max(0.1, min(0.9, self.uncertainty_threshold))
+            uncertain_indices = np.where(prediction_certainty < valid_threshold)[0]
+
+            if len(uncertain_indices) == 0:
+                logger.info("No uncertain samples found for active learning")
+                return False
+
+            # Select a random subset to add to learning pool (to avoid too many similar samples)
+            selection_size = min(100, len(uncertain_indices))
+            if selection_size > 0:
+                selected_indices = np.random.choice(uncertain_indices, selection_size, replace=False)
+            else:
+                logger.info("No samples selected for active learning")
+                return False
+
+            # Initialize learning pool and labels if they don't exist
+            if not hasattr(self, 'learning_pool') or self.learning_pool is None:
+                self.learning_pool = []
+            
+            if not hasattr(self, 'learning_pool_labels') or self.learning_pool_labels is None:
+                self.learning_pool_labels = []
+                
+            # Add selected samples to learning pool with deduplication
+            added_count = 0
+            for idx in selected_indices:
+                # Skip if already in pool using efficient numpy comparison
+                if len(self.learning_pool) > 0:
+                    # Convert to numpy array for efficient comparison if not already
+                    learning_pool_array = np.array(self.learning_pool)
+                    # Check if sample is already in pool
+                    if any(np.allclose(learning_pool_array[i], self.x_active[idx])
+                            for i in range(len(learning_pool_array))):
+                        continue
+
+                # Add if not already in pool
+                self.learning_pool.append(self.x_active[idx])
+                self.learning_pool_labels.append(self.y_active_onehot[idx])
+                added_count += 1
+
+            logger.info(f"Added {added_count} new samples to learning pool")
+            logger.info(f"Learning pool now contains {len(self.learning_pool)} samples")
+
+            # Save learning pool periodically
+            if len(self.learning_pool) > 0 and len(self.learning_pool) % 100 == 0:
+                # Check if save_learning_pool method exists
+                if hasattr(self, 'save_learning_pool') and callable(getattr(self, 'save_learning_pool')):
+                    self.save_learning_pool()
+                else:
+                    logger.warning("save_learning_pool method not found")
+
+            return added_count > 0
+
+        except Exception as e:
+            logger.error(f"Error in active_learning_sample_selection: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
+        
+    def self_improve(self):
+        """Main self-improvement loop with error handling"""
+        original_version = None
+        try:
+            logger.info("\nStarting self-improvement cycle...")
+
+            if not self.data_loaded or self.model is None:
+                logger.error("Cannot self-improve: Data not loaded or model not built")
+                return False
+
+            # Store original version for rollback if needed
+            original_version = self.version if hasattr(self, 'version') else 0
+
+            # 1. Identify improvement areas
+            if hasattr(self, 'identify_improvement_areas') and callable(getattr(self, 'identify_improvement_areas')):
+                misclassified, uncertain, confusion_pair = self.identify_improvement_areas()
+                if misclassified is None:
+                    logger.warning("Could not identify improvement areas, using default strategy")
+            else:
+                logger.error("identify_improvement_areas method not available")
+                return False
+
+            # 2. Perform active learning sample selection
+            if hasattr(self, 'active_learning_sample_selection') and callable(getattr(self, 'active_learning_sample_selection')):
+                al_success = self.active_learning_sample_selection()
+                if not al_success:
+                    logger.warning("Active learning did not add new samples")
+            else:
+                logger.error("active_learning_sample_selection method not available")
+                return False
+
+            # 3. Update model architecture or hyperparameters if needed
+            architecture_changed = False
+            if hasattr(self, 'evolve_model') and callable(getattr(self, 'evolve_model')):
+                architecture_changed = self.evolve_model()
+            else:
+                logger.warning("evolve_model method not available, skipping architecture evolution")
+
+            # 4. Increment version and train the new model
+            if not hasattr(self, 'version'):
+                self.version = 0
+            self.version += 1
+            
+            if hasattr(self, 'train') and callable(getattr(self, 'train')):
+                training_success = self.train()
+                if not training_success:
+                    logger.error("Training failed during self-improvement")
+                    self.version = original_version  # Revert to original version
+                    return False
+            else:
+                logger.error("train method not available")
+                self.version = original_version  # Revert to original version
+                return False
+
+            # 5. Update uncertainty threshold based on model performance
+            if hasattr(self, 'update_uncertainty_threshold') and callable(getattr(self, 'update_uncertainty_threshold')):
+                self.update_uncertainty_threshold()
+            else:
+                logger.warning("update_uncertainty_threshold method not available, skipping threshold update")
+
+            # 6. Save evolved model
+            if hasattr(self, 'save_model') and callable(getattr(self, 'save_model')):
+                self.save_model()
+            else:
+                logger.warning("save_model method not available, model not saved")
+                
+            logger.info(f"Self-improvement cycle completed successfully. New version: {self.version}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error in self_improve method: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Revert version increment if error occurred
+            if original_version is not None:
+                self.version = original_version
+            return False
+        
+    def update_uncertainty_threshold(self):
+        """Update uncertainty threshold based on model performance"""
+        try:
+            # Check if performance_history exists and has enough entries
+            if not hasattr(self, 'performance_history') or self.performance_history is None:
+                logger.warning("Cannot update uncertainty threshold: performance_history not initialized")
+                return
+                
+            if len(self.performance_history) < 2:
+                logger.info("Not enough performance history to update uncertainty threshold")
+                return
+                
+            # Check if uncertainty_threshold exists, initialize if not
+            if not hasattr(self, 'uncertainty_threshold'):
+                self.uncertainty_threshold = 0.5
+                logger.info(f"Initialized uncertainty threshold to default value: {self.uncertainty_threshold}")
+                return
+                
+            current_acc = self.performance_history[-1].get('test_accuracy')
+            previous_acc = self.performance_history[-2].get('test_accuracy')
+
+            # Only adjust if we have valid accuracy values
+            if (current_acc is None or previous_acc is None or 
+                not (0 <= current_acc <= 1) or not (0 <= previous_acc <= 1)):
+                logger.warning("Invalid accuracy values, cannot update uncertainty threshold")
+                return
+                
+            if current_acc > previous_acc:
+                # Model improved, reduce threshold (be more selective)
+                new_threshold = max(0.1, self.uncertainty_threshold * 0.9)
+            else:
+                # Model didn't improve, increase threshold (be more inclusive)
+                new_threshold = min(0.9, self.uncertainty_threshold * 1.1)
+
+            logger.info(f"Adjusted uncertainty threshold: {self.uncertainty_threshold:.3f} -> {new_threshold:.3f}")
+            self.uncertainty_threshold = new_threshold
+            
+        except Exception as e:
+            logger.warning(f"Failed to update uncertainty threshold: {str(e)}")
+            logger.debug(traceback.format_exc())
+
+    def evolve_model(self):
+        """Evolve model architecture based on performance with error handling"""
+        try:
+            if not hasattr(self, 'history') or self.history is None:
+                logger.warning("No training history available, skipping model evolution")
+                return False
+
+            # Check if we have enough history to detect trends
+            if not hasattr(self.history, 'history') or len(self.history.history.get('val_loss', [])) < 3:
+                logger.info("Not enough training history to evolve model")
+                return False
+
+            # Get training and validation metrics
+            train_loss_end = self.history.history['loss'][-1]
+            val_loss_end = self.history.history['val_loss'][-1]
+
+            # Check for overfitting or underfitting
+            if val_loss_end <= 0 or train_loss_end <= 0:  # Avoid division by zero
+                logger.warning("Invalid loss values detected, skipping model evolution")
+                return False
+                
+            overfitting_ratio = train_loss_end / val_loss_end
+            
+            # Save current weights before rebuilding
+            weights_path = None
+            try:
+                weights_path = f"temp_weights_v{self.version}.h5"
+                self.model.save_weights(weights_path)
+                logger.info(f"Saved temporary weights to {weights_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save temporary weights: {str(e)}")
+                weights_path = None
+
+            # Determine architecture adjustments based on overfitting/underfitting
+            success = False
+            if overfitting_ratio < 0.6:  # Significant overfitting
+                logger.info(f"Detected overfitting (ratio: {overfitting_ratio:.2f}), simplifying model")
+                if hasattr(self, '_create_simpler_architecture') and callable(getattr(self, '_create_simpler_architecture')):
+                    success = self.build_model(custom_architecture=self._create_simpler_architecture())
+                else:
+                    logger.warning("_create_simpler_architecture method not available")
+                    return False
+            elif overfitting_ratio > 0.95:  # Underfitting
+                logger.info(f"Detected underfitting (ratio: {overfitting_ratio:.2f}), increasing model capacity")
+                if hasattr(self, '_create_complex_architecture') and callable(getattr(self, '_create_complex_architecture')):
+                    success = self.build_model(custom_architecture=self._create_complex_architecture())
+                else:
+                    logger.warning("_create_complex_architecture method not available")
+                    return False
+            else:
+                logger.info(f"Model complexity seems appropriate (ratio: {overfitting_ratio:.2f}), making minor adjustments")
+                if hasattr(self, '_create_refined_architecture') and callable(getattr(self, '_create_refined_architecture')):
+                    success = self.build_model(custom_architecture=self._create_refined_architecture())
+                else:
+                    logger.warning("_create_refined_architecture method not available")
+                    return False
+
+            # Restore weights if possible and applicable
+            if success and weights_path and os.path.exists(weights_path):
+                try:
+                    # Try to load compatible weights
+                    self.model.load_weights(weights_path, by_name=True, skip_mismatch=True)
+                    logger.info("Restored compatible weights from previous version")
+                except Exception as e:
+                    logger.warning(f"Could not restore weights: {str(e)}")
+
+                # Clean up temporary weights file
+                try:
+                    os.remove(weights_path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temporary weights file: {str(e)}")
+
+            return success
+
+        except Exception as e:
+            logger.error(f"Error in evolve_model: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
+        
+    def _create_simpler_architecture(self):
+        """Create a simpler architecture to combat overfitting"""
+        def architecture(inputs):
+            try:
+                # Reshape for CNN - add channel dimension
+                x = layers.Reshape((*self.input_shape, 1))(inputs)
+
+                # Simpler architecture with stronger regularization
+                x = layers.Conv2D(16, (3, 3), activation='relu', padding='same')(x)
+                x = layers.BatchNormalization()(x)
+                x = layers.Dropout(0.3)(x)
+                x = layers.MaxPooling2D((2, 2))(x)
+
+                x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+                x = layers.BatchNormalization()(x)
+                x = layers.Dropout(0.4)(x)
+                x = layers.MaxPooling2D((2, 2))(x)
+
+                # Calculate dimensions dynamically
+                new_shape = ((self.input_shape[0] // 4), (self.input_shape[1] // 4) * 32)
+                x = layers.Reshape(new_shape)(x)
+
+                # Single RNN layer
+                x = layers.Bidirectional(layers.LSTM(64))(x)
+                x = layers.Dropout(0.4)(x)
+
+                # Smaller fully connected layer
+                x = layers.Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.001))(x)
+                x = layers.BatchNormalization()(x)
+                x = layers.Dropout(0.5)(x)
+
+                return x
+            except Exception as e:
+                logger.error(f"Error in simpler architecture: {str(e)}")
+                # Return default architecture if this fails
+                return self._create_default_architecture()(inputs)
+
+        return architecture
+    
+    def _create_complex_architecture(self):
+        """Create a more complex architecture to combat underfitting"""
+        def architecture(inputs):
+            try:
+                # Check if input_shape attribute exists
+                if not hasattr(self, 'input_shape') or self.input_shape is None:
+                    logger.error("Input shape not defined")
+                    return self._create_default_architecture()(inputs)
+                    
+                # Validate input shape has at least 2 dimensions
+                if len(self.input_shape) < 2:
+                    logger.error(f"Invalid input shape: {self.input_shape}")
+                    return self._create_default_architecture()(inputs)
+                    
+                # Check if input dimensions are large enough for multiple pooling operations
+                min_dimension_required = 8  # Need at least 8x8 for 3 pooling operations
+                if self.input_shape[0] < min_dimension_required or self.input_shape[1] < min_dimension_required:
+                    logger.warning(f"Input dimensions too small for complex architecture: {self.input_shape}")
+                    # Adjust pooling strategy for small inputs or use simpler architecture
+                    return self._create_simpler_architecture()(inputs)
+                    
+                # Reshape for CNN - add channel dimension
+                x = layers.Reshape((*self.input_shape, 1))(inputs)
+
+                # More complex CNN with residual connections
+                # First block with residual connection
+                input_layer = x
+                x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+                x = layers.BatchNormalization()(x)
+                x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+                x = layers.BatchNormalization()(x)
+                # Add 1x1 conv to match shapes for residual
+                input_layer = layers.Conv2D(32, (1, 1), padding='same')(input_layer)
+                x = layers.add([x, input_layer])
+                x = layers.MaxPooling2D((2, 2))(x)
+                x = layers.Dropout(0.2)(x)
+
+                # Second block with residual connection
+                input_layer = x
+                x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+                x = layers.BatchNormalization()(x)
+                x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+                x = layers.BatchNormalization()(x)
+                # Add 1x1 conv to match shapes for residual
+                input_layer = layers.Conv2D(64, (1, 1), padding='same')(input_layer)
+                x = layers.add([x, input_layer])
+                x = layers.MaxPooling2D((2, 2))(x)
+                x = layers.Dropout(0.2)(x)
+
+                # Third block
+                x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
+                x = layers.BatchNormalization()(x)
+                x = layers.MaxPooling2D((2, 2))(x)
+                x = layers.Dropout(0.2)(x)
+
+                try:
+                    # Calculate dimensions dynamically based on pooling operations
+                    pool_factor = 8  # 2^3 because of three MaxPooling2D layers
+                    new_height = max(1, self.input_shape[0] // pool_factor)
+                    new_width = max(1, self.input_shape[1] // pool_factor)
+                    new_shape = (new_height, new_width * 128)
+                    x = layers.Reshape(new_shape)(x)
+
+                    # More complex RNN stack
+                    x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(x)
+                    x = layers.LayerNormalization()(x)
+                    x = layers.Dropout(0.2)(x)
+                    x = layers.Bidirectional(layers.LSTM(64))(x)
+                    x = layers.LayerNormalization()(x)
+                    x = layers.Dropout(0.2)(x)
+                except Exception as e:
+                    logger.warning(f"Failed to apply Reshape or RNN layers: {str(e)}")
+                    # Fallback to flatten if reshape or RNN fails
+                    x = layers.Flatten()(x)
+                    x = layers.Dropout(0.2)(x)
+
+                # Wider fully connected layers
+                x = layers.Dense(256, activation='relu')(x)
+                x = layers.BatchNormalization()(x)
+                x = layers.Dropout(0.3)(x)
+                x = layers.Dense(128, activation='relu')(x)
+                x = layers.BatchNormalization()(x)
+                x = layers.Dropout(0.3)(x)
+
+                return x
+            except Exception as e:
+                logger.error(f"Error in complex architecture: {str(e)}")
+                logger.error(traceback.format_exc())
+                
+                # Check if default architecture method exists
+                if hasattr(self, '_create_default_architecture') and callable(getattr(self, '_create_default_architecture')):
+                    return self._create_default_architecture()(inputs)
+                else:
+                    # Fallback to a very basic architecture if default is not available
+                    logger.error("Default architecture not available, using basic fallback")
+                    x = layers.Flatten()(inputs)
+                    x = layers.Dense(128, activation='relu')(x)
+                    x = layers.Dropout(0.3)(x)
+                    return x
+
+        return architecture
